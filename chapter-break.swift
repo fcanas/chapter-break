@@ -62,6 +62,39 @@ func runProcess(executableURL: URL, arguments: [String]) throws -> (status: Int3
     return (process.terminationStatus, output, error)
 }
 
+// Helper function to find an executable using 'which' via /usr/bin/env
+func findExecutable(named executableName: String) -> URL? {
+    let envURL = URL(fileURLWithPath: "/usr/bin/env")
+
+    guard FileManager.default.fileExists(atPath: envURL.path) else {
+        print("Error: /usr/bin/env not found. Cannot search for executables.")
+        return nil
+    }
+
+    do {
+        let (status, stdout, stderr) = try runProcess(executableURL: envURL, arguments: ["which", executableName])
+        
+        if status == 0 {
+            let path = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Double-check that the path is not empty and the file exists
+            if !path.isEmpty && FileManager.default.isExecutableFile(atPath: path) {
+                return URL(fileURLWithPath: path)
+            } else {
+                 print("  'env which \(executableName)' returned invalid path or file not found: '\(path)'")
+            }
+        } else {
+            // Log stderr from 'which' if it failed
+            let errorMsg = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("  'env which \(executableName)' failed (Status: \(status)). \(errorMsg.isEmpty ? "" : "Stderr: \(errorMsg)")")
+        }
+    } catch {
+        print("  Error running '/usr/bin/env which \(executableName)': \(error)")
+    }
+
+    print("Error: Could not find executable '\(executableName)'. Please ensure it is installed and in your PATH.")
+    return nil
+}
+
 // Removes characters potentially problematic for filenames
 func sanitizeFilename(_ filename: String) -> String {
     var sanitized = filename
@@ -94,22 +127,16 @@ func sanitizeFilename(_ filename: String) -> String {
     
     // 7. Optional: Limit filename length (macOS limit is typically 255 bytes)
     let maxLength = 200 // Be conservative
-    if sanitized.utf8.count > maxLength {
-        // Find the boundary closest to maxLength
-        var cutIndex = sanitized.startIndex
-        var currentLength = 0
-        while let nextIndex = sanitized.index(cutIndex, offsetBy: 1, limitedBy: sanitized.endIndex) {
-            let charLength = String(sanitized[cutIndex]).utf8.count
-            if currentLength + charLength > maxLength {
-                break
-            }
-            currentLength += charLength
-            cutIndex = nextIndex
+    if sanitized.utf8.count > maxLength { // Check byte count for underlying OS limit
+        // Use prefix based on character count (grapheme clusters) for simpler truncation
+        // This might slightly exceed byte limit if multi-byte chars are near the end, but is safer for user-visible strings
+        let truncated = String(sanitized.prefix(maxLength))
+        // Re-trim potentially reintroduced whitespace/underscores if cut happened there
+        sanitized = truncated.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "_")))
+         // Ensure it didn't become empty after re-trimming
+        if sanitized.isEmpty {
+             return "Untitled_Chapter_\(UUID().uuidString.prefix(8))" // Fallback again
         }
-        sanitized = String(sanitized[..<cutIndex])
-        // Re-trim trailing whitespace/underscores potentially introduced by cutting
-         sanitized = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
-         sanitized = sanitized.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
     }
 
     return sanitized
@@ -131,25 +158,23 @@ guard FileManager.default.fileExists(atPath: inputFilePath) else {
     exit(1)
 }
 
-// 2. Define Paths
+// 2. Define Paths & Find Executables
 let outputDirectoryName = "output"
 let outputDirectoryURL = URL(fileURLWithPath: outputDirectoryName)
-let ffmpegPath = "/opt/homebrew/bin/ffmpeg" // Adjust if ffmpeg is elsewhere
-let ffprobePath = "/opt/homebrew/bin/ffprobe" // Adjust if ffprobe is elsewhere
-let ffmpegURL = URL(fileURLWithPath: ffmpegPath)
-let ffprobeURL = URL(fileURLWithPath: ffprobePath)
 
-// Check if ffmpeg exists
-guard FileManager.default.fileExists(atPath: ffmpegPath) else {
-    print("Error: ffmpeg not found at '\(ffmpegPath)'. Please install ffmpeg and adjust the path if necessary.")
+print("Resolving dependencies...")
+// Find ffmpeg and ffprobe dynamically
+guard let ffmpegURL = findExecutable(named: "ffmpeg") else {
+    // Error message printed within findExecutable
     exit(1)
 }
-// Check if ffprobe exists
-guard FileManager.default.fileExists(atPath: ffprobePath) else {
-    print("Error: ffprobe not found at '\(ffprobePath)'. Please install ffprobe (usually included with ffmpeg) and adjust the path if necessary.")
+print("  ffmpeg:  \(ffmpegURL.path())")
+
+guard let ffprobeURL = findExecutable(named: "ffprobe") else {
+    // Error message printed within findExecutable
     exit(1)
 }
-
+print("  ffprobe: \(ffprobeURL.path())")
 
 // 3. Create Output Directory
 do {
@@ -161,7 +186,7 @@ do {
 }
 
 // 4. Extract Metadata using ffprobe (JSON output)
-print("Extracting chapter metadata using ffprobe from '\(inputFilePath)'...")
+print("Extracting chapter metadata from '\(inputFilePath)'...")
 var chapterJSONData: Data?
 do {
     // Arguments for ffprobe to output chapters as JSON
@@ -186,7 +211,6 @@ do {
         exit(1)
     }
     chapterJSONData = jsonData
-    print("Metadata extracted successfully.")
 
 } catch {
     print("Error: Failed to run ffprobe for metadata extraction: \(error)")
@@ -196,78 +220,81 @@ do {
 // 5. Read and Parse Metadata (Now using JSONDecoder)
 var chapters: [ChapterInfo] = []
 
-if let jsonData = chapterJSONData {
-    do {
-        let decoder = JSONDecoder()
-        let ffprobeOutput = try decoder.decode(FFProbeOutput.self, from: jsonData)
+guard let jsonData = chapterJSONData else 
+{
+    print("Error: Chapter JSON data was not available for parsing.")
+    exit(1)
+}
+
+do {
+    let decoder = JSONDecoder()
+    let ffprobeOutput = try decoder.decode(FFProbeOutput.self, from: jsonData)
+    
+    // Map FFProbeChapter to ChapterInfo
+    var chapterIndex = 0 // For generating default titles
+    chapters = ffprobeOutput.chapters.compactMap { ffprobeChapter in
+        let startTimeDouble: Double?
         
-        // Map FFProbeChapter to ChapterInfo
-        var chapterIndex = 0 // For generating default titles
-        chapters = ffprobeOutput.chapters.compactMap { ffprobeChapter in
-            // Prefer the precise start_time string if available and valid
-            if let startTimeDouble = Double(ffprobeChapter.startTime) {
-                let finalTitle: String
-                if let title = ffprobeChapter.tags?.title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
-                    finalTitle = title
-                } else {
-                    chapterIndex += 1
-                    finalTitle = String(format: "Chapter_%02d", chapterIndex)
-                    print("Warning: Chapter ID \(ffprobeChapter.id) found with missing title. Using default: '\(finalTitle)'")
-                }
-                return ChapterInfo(title: finalTitle, startTime: startTimeDouble)
+        // Try parsing the precise start_time string first
+        if let parsedTime = Double(ffprobeChapter.startTime) {
+            startTimeDouble = parsedTime
+        } else {
+            // Fallback: Try calculating from start and time_base
+            print("Warning: Could not parse start_time string '\(ffprobeChapter.startTime)' for chapter ID \(ffprobeChapter.id). Attempting fallback calculation.")
+            let tbComponents = ffprobeChapter.timeBase.split(separator: "/")
+            if tbComponents.count == 2,
+                let num = Double(tbComponents[0]),
+                let den = Double(tbComponents[1]), den != 0 {
+                startTimeDouble = Double(ffprobeChapter.start) * num / den
             } else {
-                // Fallback: Try calculating from start and time_base if start_time is invalid/missing
-                print("Warning: Could not parse start_time string '\(ffprobeChapter.startTime)' for chapter ID \(ffprobeChapter.id). Attempting fallback calculation.")
-                let tbComponents = ffprobeChapter.timeBase.split(separator: "/")
-                if tbComponents.count == 2,
-                   let num = Double(tbComponents[0]),
-                   let den = Double(tbComponents[1]), den != 0 {
-                    let startTimeDouble = Double(ffprobeChapter.start) * num / den
-                    
-                     let finalTitle: String
-                    if let title = ffprobeChapter.tags?.title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
-                        finalTitle = title
-                    } else {
-                        chapterIndex += 1
-                        finalTitle = String(format: "Chapter_%02d", chapterIndex)
-                        print("Warning: Chapter ID \(ffprobeChapter.id) found with missing title. Using default: '\(finalTitle)'")
-                    }
-                    return ChapterInfo(title: finalTitle, startTime: startTimeDouble)
-                } else {
-                     print("Error: Could not parse time_base '\(ffprobeChapter.timeBase)' or start value '\(ffprobeChapter.start)' for chapter ID \(ffprobeChapter.id). Skipping chapter.")
-                    return nil // Skip chapter if time can't be determined
-                }
+                // Could not determine start time, skip this chapter
+                print("Error: Could not parse time_base '\(ffprobeChapter.timeBase)' or start value '\(ffprobeChapter.start)' for chapter ID \(ffprobeChapter.id) during fallback. Skipping chapter.")
+                startTimeDouble = nil // Indicate failure
             }
         }
-        // Sort chapters by start time just in case ffprobe output is not ordered (though it usually is)
-         chapters.sort { $0.startTime < $1.startTime }
-
-    } catch {
-        print("Error: Failed to decode chapter JSON: \(error)")
-        // Print the JSON data for debugging if decoding fails
-        if let jsonString = String(data: jsonData, encoding: .utf8) {
-             print("--- JSON Data Start ---")
-             print(jsonString)
-             print("--- JSON Data End ---")
+        
+        // Ensure we have a valid start time before proceeding
+        guard let finalStartTime = startTimeDouble else {
+            return nil // Skip chapter if time determination failed
         }
-        // Decide if this is a fatal error
-        // exit(1) // Uncomment to make decoding errors fatal
+        
+        // Determine the chapter title (use default if missing/empty)
+        let finalTitle: String
+        if let title = ffprobeChapter.tags?.title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
+            finalTitle = title
+        } else {
+            chapterIndex += 1
+            finalTitle = String(format: "Chapter_%02d", chapterIndex)
+            print("Warning: Chapter ID \(ffprobeChapter.id) found with missing title. Using default: '\(finalTitle)'")
+        }
+        
+        // Create and return the ChapterInfo object
+        return ChapterInfo(title: finalTitle, startTime: finalStartTime)
     }
-} else {
-     print("Error: Chapter JSON data was not available for parsing.")
-     // exit(1) // Uncomment to make missing data fatal
+    
+    // Sort chapters by start time just in case ffprobe output is not ordered
+    chapters.sort { $0.startTime < $1.startTime }
+
+} catch {
+    print("Error: Failed to decode chapter JSON: \(error)")
+    // Print the JSON data for debugging if decoding fails
+    if let jsonString = String(data: jsonData, encoding: .utf8) {
+            print("--- JSON Data Start ---")
+            print(jsonString)
+            print("--- JSON Data End ---")
+    }
+    exit(1)
 }
 
-if chapters.isEmpty {
-     print("Warning: No chapters parsed from metadata. Does the input file have chapters?")
-     // Decide if this is an error or just continue (currently continues)
-} else {
-    print("Found \(chapters.count) chapters.")
+guard !chapters.isEmpty else {
+     print("Error: No chapters parsed from metadata. Does the input file have chapters?")
+     exit(1)
 }
 
+print("Found \(chapters.count) chapters.")
 
 // 6. Split Chapters using ffmpeg
-print("Starting chapter splitting...")
+print("Splitting chapters...")
 for i in 0..<chapters.count {
     let chapter = chapters[i]
     let chapterNumber = i + 1
@@ -297,7 +324,9 @@ for i in 0..<chapters.count {
         outputFileURL.path
     ])
 
-    print("  [\(chapterNumber)/\(chapters.count)] Extracting '\(chapter.title)' to '\(outputFilename)'...") // Use chapter.title
+    let chapterProgress = " [-] [\(chapterNumber)/\(chapters.count)]  '\(chapter.title)' to '\(outputFilename)'..."
+    // print chapterProgress without a newline
+    print(chapterProgress, terminator: "")
 
     do {
         let (status, _, stderr) = try runProcess(executableURL: ffmpegURL, arguments: ffmpegSplitArgs)
@@ -306,15 +335,18 @@ for i in 0..<chapters.count {
             print("    ffmpeg stderr:\n\(stderr)")
             // Optional: Decide whether to continue or exit on chapter error
         } else {
-             print("    Successfully extracted chapter \(chapterNumber).")
+             // go back the bumber of characters in chapterProgress
+             // print a green checkmark
+             print("\u{1b}[\(chapterProgress.count - 2)D\u{001b}[32m✔︎\u{001b}[0m")
         }
     } catch {
+        // go back the bumber of characters in chapterProgress
+        // print a red x
+        print("\u{1b}[\(chapterProgress.count - 2)D\u{001b}[31m✗\u{001b}[0m")
         print("    Error: Failed to run ffmpeg for chapter \(chapterNumber): \(error)")
         // Optional: Decide whether to continue or exit on chapter error
     }
 }
-
-// 7. Clean up temporary file (No longer needed)
 
 print("Chapter splitting complete. Output files are in '\(outputDirectoryName)/'")
 exit(0) 
