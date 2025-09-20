@@ -37,9 +37,27 @@ brew install ffmpeg
 
 The script will create an `output` directory in the same location where you run the script. Inside this directory, you will find the individual chapter files, named using a two-digit chapter number prefix and a sanitized version of the chapter title (e.g., `01_Introduction.m4b`, `02_The_First_Step.m4b`, etc.).
 
+## rebind
+
+Re-assemble chapter `.m4b` files into a single audiobook, preserving chapter markers.
+
+### Usage
+
+1.  **Make the script executable:**
+    ```bash
+    chmod +x rebind.swift
+    ```
+
+2.  **Run the script:**
+    The first argument is the output file. Subsequent arguments are chapters to re-combine into a single audio file.
+    ```bash
+    ./rebind.swift combined.m4b output/01_*.m4b output/02_*.m4b ...
+    ```
+
 ## Notes
 
 *   The script is primarily for macOS but might work on Linux if Swift and ffmpeg are installed.
 *   Filename sanitization removes common problematic characters (`/:"<>|?*&%$!@^`~`, smart quotes `""''`, control characters, null) and replaces them with underscores.
 *   If chapter titles are missing in the metadata, default names like `Chapter_01`, `Chapter_02` will be used.
 *   The script copies the audio codec (`-c copy`) and global metadata (`-map_metadata 0`) without re-encoding, making the process fast and lossless. 
+
