@@ -100,32 +100,33 @@ func createConcatFileList(inputFiles: [URL]) throws -> URL {
 }
 
 // Function to create chapter metadata file for ffmpeg
-func createChapterMetadata(chapters: [ChapterInfo]) throws -> URL {
+func createChapterMetadata(chapters: [ChapterInfo], totalDurationSeconds: Double) throws -> URL {
     let tempDir = FileManager.default.temporaryDirectory
     let metadataFileURL = tempDir.appendingPathComponent("chapter_metadata_\(UUID().uuidString).txt")
     
-    let metadataContent = createChapterMetadataContent(chapters: chapters)
+    let metadataContent = createChapterMetadataContent(chapters: chapters, totalDurationSeconds: totalDurationSeconds)
     try metadataContent.write(to: metadataFileURL, atomically: true, encoding: .utf8)
     
     return metadataFileURL
 }
 
 // Function to create chapter metadata content
-func createChapterMetadataContent(chapters: [ChapterInfo]) -> String {
-    var metadataContent = ""
+func createChapterMetadataContent(chapters: [ChapterInfo], totalDurationSeconds: Double) -> String {
+    var metadataContent = "FFMETADATA1\n"
     for (index, chapter) in chapters.enumerated() {
         metadataContent += "[CHAPTER]\n"
         metadataContent += "TIMEBASE=1/1000\n"
         metadataContent += "START=\(Int(chapter.startTime * 1000))\n"
         
         // Calculate end time - use next chapter's start time or a large number for the last chapter
-        let endTime: Int
-        if index < chapters.count - 1 {
-            endTime = Int(chapters[index + 1].startTime * 1000)
-        } else {
-            // For the last chapter, use a very large end time
-            endTime = Int(chapter.startTime * 1000 + 1000000) // 1000 seconds after start
-        }
+        let endTime: Int = {
+            if index < chapters.count - 1 {
+                return Int(chapters[index + 1].startTime * 1000)
+            } else {
+                // Last chapter ends at total duration
+                return Int(totalDurationSeconds * 1000)
+            }
+        }()
         metadataContent += "END=\(endTime)\n"
         metadataContent += "title=\(chapter.title)\n"
         metadataContent += "\n"
@@ -219,7 +220,7 @@ let metadataFileURL: URL
 
 do {
     concatFileURL = try createConcatFileList(inputFiles: inputFileURLs)
-    metadataFileURL = try createChapterMetadata(chapters: chapters)
+    metadataFileURL = try createChapterMetadata(chapters: chapters, totalDurationSeconds: currentTime)
     print("  ✓ Created temporary files")
 } catch {
     print("Error: Failed to create temporary files: \(error)")
@@ -233,7 +234,12 @@ let ffmpegArgs = [
     "-f", "concat",
     "-safe", "0",
     "-i", concatFileURL.path,
+    "-f", "ffmetadata",
+    "-i", metadataFileURL.path,
+    "-map_metadata", "1",
+    "-map_chapters", "1",
     "-c", "copy",  // Copy streams without re-encoding - this is the key for speed!
+    "-movflags", "use_metadata_tags",
     "-avoid_negative_ts", "make_zero",
     outputFileURL.path
 ]
@@ -256,11 +262,7 @@ do {
     exit(1)
 }
 
-// Note: Chapter metadata is not currently preserved in the output file.
-// The concatenated file will not have chapter markers that can be detected by chapter-break.
-// This is a limitation of the current implementation.
-print("\nNote: Chapter metadata is not preserved in the output file.")
-print("The concatenated audiobook will not have chapter markers.")
+// Chapters and metadata were mapped in the concat pass; validate downstream if needed.
 
 // 6. Clean up temporary files
 do {
